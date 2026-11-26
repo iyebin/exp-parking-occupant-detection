@@ -1,0 +1,11 @@
+# ExitGuard camera test - Raspberry Pi 4 (64-bit) or laptop
+ultralytics>=8.4          # YOLOv8n + YOLO26n (YOLO26 needs a recent version)
+onnx
+onnxslim
+onnxruntime               # runs the .onnx models on the Pi CPU
+ncnn                      # runs the NCNN models (also used by the export)
+pnnx                      # PyTorch -> NCNN converter used by the export
+psutil
+pandas
+matplotlib
+tabulate
