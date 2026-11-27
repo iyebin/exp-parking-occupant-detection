@@ -174,6 +174,60 @@ def parse_res(s: str) -> tuple[int, int]:
     w, h = s.lower().split("x")
     return int(w), int(h)
 
+def _use_picam(device) -> bool:
+    """True when the Pi CSI camera should be used: --device picam or EXITGUARD_CAM=picam."""
+    import os
+    return str(device).lower() == "picam" or os.environ.get("EXITGUARD_CAM", "").lower() == "picam"
+
+
+class PiCamCapture:
+    """Minimal cv2.VideoCapture look-alike for a CSI camera (e.g. Camera Module 3 NoIR) via Picamera2."""
+
+    def __init__(self, width=1280, height=720, fps=30):
+        from picamera2 import Picamera2
+        from libcamera import controls
+
+        self.w, self.h, self.fps = width, height, float(fps)
+        self.cam = Picamera2()
+        us = int(1_000_000 / fps)
+        ctrls = {"FrameDurationLimits": (us, us)}
+        if "AfMode" in self.cam.camera_controls:          # Camera Module 3 has autofocus
+            ctrls["AfMode"] = controls.AfModeEnum.Continuous
+        cfg = self.cam.create_video_configuration(
+            main={"size": (width, height), "format": "RGB888"},  # numpy order is BGR, same as OpenCV
+            controls=ctrls,
+            buffer_count=2,                                       # keep latency low, no stale frames
+        )
+        self.cam.configure(cfg)
+        self.cam.start()
+        self._frame = None
+
+    def isOpened(self):
+        return True
+
+    def grab(self):
+        self._frame = self.cam.capture_array()
+        return True
+
+    def retrieve(self, *args, **kwargs):
+        return self._frame is not None, self._frame
+
+    def read(self, *args, **kwargs):
+        self.grab()
+        return True, self._frame
+
+    def get(self, prop):
+        import cv2
+        return {cv2.CAP_PROP_FRAME_WIDTH: self.w,
+                cv2.CAP_PROP_FRAME_HEIGHT: self.h,
+                cv2.CAP_PROP_FPS: self.fps}.get(prop, 0.0)
+
+    def set(self, prop, value):
+        return False          # V4L2 properties don't apply to the Pi camera
+
+    def release(self):
+        self.cam.stop()
+        self.cam.close()
 
 def open_camera(device: str | int = 0, width=1280, height=720, fps=30,
                 fourcc="YUYV", raw=False):
@@ -191,6 +245,14 @@ def open_camera(device: str | int = 0, width=1280, height=720, fps=30,
             raise RuntimeError(f"cannot open video {device}")
         return cap, (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                      cap.get(cv2.CAP_PROP_FPS))
+    if _use_picam(device):
+        try:
+            cap = PiCamCapture(width, height, fps)
+        except Exception as e:
+            raise RuntimeError(f"cannot open Pi camera: {e}\n"
+                               "  busy? stop other camera scripts: ps aux | grep -E 'rpicam|python'")
+        return cap, (width, height, float(fps))
+
     dev = int(device) if str(device).isdigit() else device
     if sys.platform.startswith("linux"):
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
@@ -245,6 +307,9 @@ def to_bgr(frame, width: int, height: int):
 
 def set_v4l2_controls(device: str, controls: list[str]) -> None:
     """Apply v4l2-ctl controls one at a time (the Kiyo Pro can crash on some control changes)."""
+    if _use_picam(device):
+        print("  (Pi camera: v4l2 controls skipped)")
+        return
     for c in controls:
         print(f"  v4l2-ctl --set-ctrl={c}")
         r = subprocess.run(["v4l2-ctl", "-d", str(device), f"--set-ctrl={c}"],

@@ -2,6 +2,9 @@
 
   source ~/exitguard-venv/bin/activate
   python check_env.py              # add --device /dev/video2 if the camera is not video0
+
+Pi CSI camera (e.g. Camera Module 3 NoIR) instead of the Kiyo Pro:
+  export EXITGUARD_CAM=picam       # or: python check_env.py --device picam
 """
 import argparse
 import grp
@@ -32,9 +35,68 @@ def run(cmd):
         return ""
 
 
+def use_picam(device) -> bool:
+    return str(device).lower() == "picam" or os.environ.get("EXITGUARD_CAM", "").lower() == "picam"
+
+
+def check_picam():
+    """Pi CSI camera (e.g. Camera Module 3 NoIR) - checked the same way the scripts open it."""
+    cams = run("rpicam-hello --list-cameras 2>/dev/null | grep -E '^ *[0-9]+ :'")
+    show(bool(cams), "Pi camera detected", cams.strip() or "none - check ribbon cable, then reboot")
+    try:
+        import picamera2  # noqa: F401
+        show(True, "picamera2", "installed")
+    except Exception as e:
+        show(False, "picamera2", f"missing: {e.__class__.__name__} - sudo apt install -y python3-picamera2")
+        return
+    if not cams:
+        return
+    try:
+        from common import PiCamCapture
+        cap = PiCamCapture(1280, 720, 30)
+        ok, frame = False, None
+        for _ in range(10):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                break
+        cap.release()
+        show(ok, "camera gives frames", f"{frame.shape[1]}x{frame.shape[0]}" if ok else "read failed")
+    except Exception as e:
+        msg = str(e).splitlines()[0] if str(e) else e.__class__.__name__
+        show(False, "camera gives frames", msg + "  (busy? stop other camera scripts / rpicam apps)")
+
+
+def check_kiyo(device):
+    """USB webcam (Razer Kiyo Pro)."""
+    show(bool(shutil.which("v4l2-ctl")), "v4l2-ctl", "" if shutil.which("v4l2-ctl") else "sudo apt install v4l-utils")
+    usb = run("lsusb | grep -i 1532")
+    show(bool(usb), "Kiyo Pro on USB", usb or "not found - replug into a blue port")
+    tree = run("lsusb -t")
+    speed = next((ln for ln in tree.splitlines() if "uvcvideo" in ln), "")
+    show("5000M" in speed or "10000M" in speed, "USB 3 port", speed.strip() or "no uvcvideo device",
+         warn="480M" in speed)
+    show(Path(device).exists(), f"{device} exists", "" if Path(device).exists() else run("v4l2-ctl --list-devices"))
+    if Path(device).exists():
+        try:
+            import cv2
+            cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            ok, frame = False, None
+            for _ in range(10):
+                ok, frame = cap.read()
+                if ok:
+                    break
+            cap.release()
+            show(ok, "camera gives frames", f"{frame.shape[1]}x{frame.shape[0]}" if ok else "read failed - replug")
+        except Exception as e:
+            show(False, "camera gives frames", str(e))
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="/dev/video0")
+    ap.add_argument("--device", default="/dev/video0", help="/dev/videoN for the Kiyo Pro, or 'picam'")
     a = ap.parse_args()
 
     print("== system")
@@ -80,31 +142,12 @@ def main():
     nv = run("pip list 2>/dev/null | grep -i '^nvidia' | grep -vic '^nvidia-ml-py'")
     show(nv in ("", "0"), "no CUDA packages", f"{nv} nvidia_* packages - uninstall them" if nv not in ("", "0") else "")
 
-    print("== camera")
-    show(bool(shutil.which("v4l2-ctl")), "v4l2-ctl", "" if shutil.which("v4l2-ctl") else "sudo apt install v4l-utils")
-    usb = run("lsusb | grep -i 1532")
-    show(bool(usb), "Kiyo Pro on USB", usb or "not found - replug into a blue port")
-    tree = run("lsusb -t")
-    speed = next((ln for ln in tree.splitlines() if "uvcvideo" in ln), "")
-    show("5000M" in speed or "10000M" in speed, "USB 3 port", speed.strip() or "no uvcvideo device",
-         warn="480M" in speed)
-    show(Path(a.device).exists(), f"{a.device} exists", "" if Path(a.device).exists() else run("v4l2-ctl --list-devices"))
-    if Path(a.device).exists():
-        try:
-            import cv2
-            cap = cv2.VideoCapture(a.device, cv2.CAP_V4L2)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            ok, frame = False, None
-            for _ in range(10):
-                ok, frame = cap.read()
-                if ok:
-                    break
-            cap.release()
-            show(ok, "camera gives frames", f"{frame.shape[1]}x{frame.shape[0]}" if ok else "read failed - replug")
-        except Exception as e:
-            show(False, "camera gives frames", str(e))
+    if use_picam(a.device):
+        print("== camera (Pi CSI camera)")
+        check_picam()
+    else:
+        print("== camera (Kiyo Pro USB)")
+        check_kiyo(a.device)
 
     print("== power + temperature")
     if shutil.which("vcgencmd"):
